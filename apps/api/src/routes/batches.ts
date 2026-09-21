@@ -115,10 +115,15 @@ export async function batchRoutes(app: FastifyInstance): Promise<void> {
         [request.params.id]
       ),
       pool.query(
-        `SELECT id, change_type AS "changeType", before_color_name AS "beforeColorName", before_color_hex AS "beforeColorHex",
-                after_color_name AS "afterColorName", after_color_hex AS "afterColorHex", occurred_at AS "occurredAt",
-                notes, project_id AS "projectId", consumption_id AS "consumptionId"
-           FROM color_changes WHERE batch_id = $1 ORDER BY occurred_at DESC, created_at DESC`,
+        `SELECT cc.id, cc.change_type AS "changeType", cc.before_color_name AS "beforeColorName", cc.before_color_hex AS "beforeColorHex",
+                cc.after_color_name AS "afterColorName", cc.after_color_hex AS "afterColorHex", cc.occurred_at AS "occurredAt",
+                cc.notes, cc.seq, cc.voided_at AS "voidedAt", cc.void_reason AS "voidReason",
+                cc.project_id AS "projectId", cc.consumption_id AS "consumptionId",
+                (SELECT count(*)::int FROM attachments a
+                  WHERE a.owner_type = 'COLOR_CHANGE' AND a.owner_id = cc.id AND a.phase = 'BEFORE') AS "beforeAttachmentCount",
+                (SELECT count(*)::int FROM attachments a
+                  WHERE a.owner_type = 'COLOR_CHANGE' AND a.owner_id = cc.id AND a.phase = 'AFTER') AS "afterAttachmentCount"
+           FROM color_changes cc WHERE cc.batch_id = $1 ORDER BY cc.occurred_at DESC, cc.seq DESC`,
         [request.params.id]
       ),
       pool.query(

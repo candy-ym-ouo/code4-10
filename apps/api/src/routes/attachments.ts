@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import { access, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { FastifyInstance } from "fastify";
-import { attachmentOwnerTypes, type AttachmentOwnerType } from "@handcraft/contracts";
+import { attachmentOwnerTypes, attachmentPhases, type AttachmentOwnerType, type AttachmentPhase } from "@handcraft/contracts";
 import type { AuthenticatedRequest } from "../lib/auth.js";
 import { pool, withTransaction } from "../lib/db.js";
 import { AppError } from "../lib/errors.js";
@@ -58,6 +58,18 @@ export async function attachmentRoutes(app: FastifyInstance): Promise<void> {
       throw new AppError(422, "INVALID_OWNER_TYPE", "附件归属类型无效");
     }
     if (!fields.ownerId) throw new AppError(422, "INVALID_OWNER_ID", "附件归属记录不能为空");
+
+    const ownerType = fields.ownerType as AttachmentOwnerType;
+    let phase: AttachmentPhase | null = null;
+    if (fields.phase) {
+      if (!attachmentPhases.includes(fields.phase as AttachmentPhase)) {
+        throw new AppError(422, "INVALID_PHASE", "证据阶段只能是 BEFORE 或 AFTER");
+      }
+      phase = fields.phase as AttachmentPhase;
+    }
+    if (ownerType === "COLOR_CHANGE" && !phase) {
+      throw new AppError(422, "PHASE_REQUIRED", "颜色变化证据必须标记为变化前或变化后");
+    }
     if (!filePart) throw new AppError(422, "FILE_REQUIRED", "请选择图片文件");
     if (!mimeExtensions[filePart.mimetype]) throw new AppError(415, "UNSUPPORTED_FILE_TYPE", "只支持 JPG、PNG 和 WebP 图片");
     if (filePart.buffer.length <= 0 || filePart.buffer.length > config.MAX_UPLOAD_BYTES) {
@@ -66,8 +78,6 @@ export async function attachmentRoutes(app: FastifyInstance): Promise<void> {
     if (!hasExpectedMagic(filePart.buffer, filePart.mimetype)) {
       throw new AppError(415, "INVALID_FILE_CONTENT", "文件内容与图片类型不匹配");
     }
-
-    const ownerType = fields.ownerType as AttachmentOwnerType;
 
     const storageKey = `${ownerType.toLowerCase()}/${randomUUID()}${mimeExtensions[filePart.mimetype]}`;
     const destination = uploadPath(storageKey);
@@ -88,16 +98,27 @@ export async function attachmentRoutes(app: FastifyInstance): Promise<void> {
       const created = await withTransaction(async (client) => {
         const ownerExists = await client.query(`SELECT 1 FROM ${ownerTable[ownerType]} WHERE id = $1 FOR SHARE`, [fields.ownerId]);
         if (!ownerExists.rowCount) throw new AppError(422, "INVALID_OWNER", "附件归属记录不存在");
+        if (ownerType === "COLOR_CHANGE") {
+          const locked = await client.query(
+            `SELECT b.status, c.voided_at FROM color_changes c
+               JOIN batches b ON b.id = c.batch_id
+              WHERE c.id = $1 FOR UPDATE OF c`,
+            [fields.ownerId]
+          );
+          if (!locked.rowCount) throw new AppError(422, "INVALID_OWNER", "颜色变化记录不存在");
+          if (locked.rows[0]?.status === "ARCHIVED") throw new AppError(409, "BATCH_ARCHIVED", "批次已归档，证据为只读");
+          if (locked.rows[0]?.voided_at) throw new AppError(409, "COLOR_CHANGE_VOIDED", "已作废记录不能再上传证据");
+        }
         const result = await client.query(
-          `INSERT INTO attachments(owner_type, owner_id, original_name, storage_key, mime_type, byte_size, sha256)
-           VALUES ($1::attachment_owner_type, $2, $3, $4, $5, $6, $7)
+          `INSERT INTO attachments(owner_type, owner_id, original_name, storage_key, mime_type, byte_size, sha256, phase)
+           VALUES ($1::attachment_owner_type, $2, $3, $4, $5, $6, $7, $8::attachment_phase)
            RETURNING id, owner_type AS "ownerType", owner_id AS "ownerId", original_name AS "originalName",
-                     mime_type AS "mimeType", byte_size::text AS "byteSize", sha256, created_at AS "createdAt"`,
-          [ownerType, fields.ownerId, originalName, storageKey, filePart.mimetype, filePart.buffer.length, sha256]
+                     mime_type AS "mimeType", byte_size::text AS "byteSize", sha256, phase, created_at AS "createdAt"`,
+          [ownerType, fields.ownerId, originalName, storageKey, filePart.mimetype, filePart.buffer.length, sha256, phase]
         );
         await writeAudit(client, {
           actorUserId: user.id, action: "UPLOAD", entityType: "ATTACHMENT", entityId: result.rows[0]?.id,
-          afterData: { ownerType, ownerId: fields.ownerId, originalName, byteSize: filePart.buffer.length },
+          afterData: { ownerType, ownerId: fields.ownerId, originalName, byteSize: filePart.buffer.length, phase },
           requestId: request.id
         });
         return result.rows[0];
@@ -146,6 +167,14 @@ export async function attachmentRoutes(app: FastifyInstance): Promise<void> {
     }
     try {
       await withTransaction(async (client) => {
+        if (attachment.owner_type === "COLOR_CHANGE") {
+          const locked = await client.query(
+            `SELECT b.status FROM color_changes c JOIN batches b ON b.id = c.batch_id
+              WHERE c.id = $1 FOR UPDATE OF c`,
+            [attachment.owner_id]
+          );
+          if (locked.rows[0]?.status === "ARCHIVED") throw new AppError(409, "BATCH_ARCHIVED", "批次已归档，证据为只读");
+        }
         await client.query("DELETE FROM attachments WHERE id = $1", [attachment.id]);
         await writeAudit(client, {
           actorUserId: user.id, action: "DELETE", entityType: "ATTACHMENT", entityId: attachment.id,

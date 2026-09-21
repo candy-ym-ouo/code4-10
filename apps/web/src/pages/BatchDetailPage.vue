@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { request, ApiError } from "@/lib/api";
@@ -7,6 +7,7 @@ import { movementLabels, statusLabels, type Project } from "@/types";
 import { createIdempotencyKey } from "@/lib/idempotency";
 import { localDateTimeValue } from "@/lib/dates";
 import AttachmentPanel from "@/components/AttachmentPanel.vue";
+import ColorEvidence from "@/components/ColorEvidence.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -16,8 +17,26 @@ const batch = ref<any>(null);
 const projects = ref<Project[]>([]);
 const adjustmentVisible = ref(false);
 const colorVisible = ref(false);
+const batchColorVisible = ref(false);
+const batchSaving = ref(false);
 const adjustment = reactive({ direction: "OUT", quantity: "", unit: "", reason: "" });
 const colorForm = reactive({ projectId: "", changeType: "OTHER", afterColorName: "", afterColorHex: "", affectedQuantity: "", unit: "", occurredAt: localDateTimeValue(), environmentNotes: "", notes: "" });
+
+type BackfillRow = {
+  key: string;
+  occurredAt: string;
+  changeType: string;
+  afterColorName: string;
+  afterColorHex: string;
+  notes: string;
+};
+function emptyBackfillRow(occurredAt = localDateTimeValue()): BackfillRow {
+  return { key: Math.random().toString(36).slice(2, 10), occurredAt, changeType: "OTHER", afterColorName: "", afterColorHex: "", notes: "" };
+}
+const backfillRows = ref<BackfillRow[]>([emptyBackfillRow()]);
+
+const activeColorChanges = computed(() => (batch.value?.colorChanges ?? []).filter((item: any) => !item.voidedAt));
+const voidedColorChanges = computed(() => (batch.value?.colorChanges ?? []).filter((item: any) => item.voidedAt));
 
 async function load() {
   loading.value = true;
@@ -91,14 +110,12 @@ async function submitColor() {
   }
   saving.value = true;
   try {
-    const response = await request<{ data: { isCurrent: boolean } }>("/color-changes", {
+    const response = await request<{ data: { currentColorChanged: boolean } }>("/color-changes", {
       method: "POST",
       body: {
         batchId: batch.value.id,
         projectId: colorForm.projectId || null,
         changeType: colorForm.changeType,
-        beforeColorName: batch.value.currentColorName,
-        beforeColorHex: batch.value.currentColorHex,
         afterColorName: colorForm.afterColorName,
         afterColorHex: colorForm.afterColorHex || null,
         affectedQuantity: colorForm.affectedQuantity || null,
@@ -108,13 +125,89 @@ async function submitColor() {
         notes: colorForm.notes || null
       }
     });
-    ElMessage.success(response.data.isCurrent ? "颜色变化已记录，当前颜色已更新" : "历史颜色已记录，当前颜色未改变");
+    ElMessage.success(response.data.currentColorChanged ? "颜色变化已记录，当前颜色已更新" : "历史颜色已补录，当前颜色未改变");
     colorVisible.value = false;
     await load();
   } catch (error) {
     ElMessage.error(error instanceof ApiError ? error.message : "颜色记录失败");
   } finally {
     saving.value = false;
+  }
+}
+
+function openBatchColorDialog() {
+  backfillRows.value = [emptyBackfillRow()];
+  batchColorVisible.value = true;
+}
+
+function addBackfillRow() {
+  const last = backfillRows.value[backfillRows.value.length - 1];
+  backfillRows.value.push(emptyBackfillRow(last?.occurredAt || localDateTimeValue()));
+}
+
+function removeBackfillRow(index: number) {
+  if (backfillRows.value.length === 1) {
+    ElMessage.warning("批量补录至少保留一条");
+    return;
+  }
+  backfillRows.value.splice(index, 1);
+}
+
+// 录入顺序不影响结果：服务端按发生时间归并重排时间链，即使整批倒序粘贴也会得到唯一当前色
+async function submitBatchColors() {
+  const rows = backfillRows.value;
+  for (const [index, row] of rows.entries()) {
+    if (!row.occurredAt) {
+      ElMessage.error(`第 ${index + 1} 行缺少发生时间`);
+      return;
+    }
+    if (!row.afterColorName.trim()) {
+      ElMessage.error(`第 ${index + 1} 行缺少变化后颜色名称`);
+      return;
+    }
+  }
+  batchSaving.value = true;
+  try {
+    const response = await request<{ data: { count: number; currentColorChanged: boolean } }>("/color-changes/batch", {
+      method: "POST",
+      body: {
+        batchId: batch.value.id,
+        changes: rows.map((row) => ({
+          key: row.key,
+          changeType: row.changeType,
+          afterColorName: row.afterColorName,
+          afterColorHex: row.afterColorHex || null,
+          occurredAt: new Date(row.occurredAt).toISOString(),
+          notes: row.notes || null
+        }))
+      }
+    });
+    ElMessage.success(`已补录 ${response.data.count} 条颜色变化，${response.data.currentColorChanged ? "当前颜色已重算" : "当前颜色未变"}`);
+    batchColorVisible.value = false;
+    await load();
+  } catch (error) {
+    ElMessage.error(error instanceof ApiError ? error.message : "批量补录失败");
+  } finally {
+    batchSaving.value = false;
+  }
+}
+
+// 作废不是删除：记录、证据和时间链全部保留，只把该条标记为误录并重算当前色
+async function voidColorChange(item: any) {
+  try {
+    const { value } = await ElMessageBox.prompt("作废后该记录与照片仍会保留在时间线中，请输入作废原因（至少 3 个字）", "作废误录颜色变化", {
+      confirmButtonText: "确认作废",
+      cancelButtonText: "取消",
+      inputPattern: /^.{3,300}$/,
+      inputErrorMessage: "原因长度需为 3 到 300 个字",
+      type: "warning"
+    });
+    await request(`/color-changes/${item.id}/void`, { method: "POST", body: { reason: value } });
+    ElMessage.success("记录已作废，当前色已重算");
+    await load();
+  } catch (error: any) {
+    if (error === "cancel" || error === "close") return;
+    ElMessage.error(error instanceof ApiError ? error.message : "作废失败");
   }
 }
 
@@ -142,6 +235,7 @@ onMounted(load);
           <el-button v-if="batch.status === 'ACTIVE'" @click="router.push({ path: '/consumptions', query: { batchId: batch.id, create: '1' } })">记录消耗</el-button>
           <el-button v-if="batch.status !== 'ARCHIVED'" @click="openAdjustmentDialog()">库存调整</el-button>
           <el-button v-if="batch.status !== 'ARCHIVED'" type="primary" @click="openColorDialog()">记录颜色变化</el-button>
+          <el-button v-if="batch.status !== 'ARCHIVED'" @click="openBatchColorDialog">批量补录颜色</el-button>
           <el-button v-if="batch.status === 'DEPLETED'" type="danger" plain @click="archive">归档</el-button>
         </div>
       </header>
@@ -178,14 +272,35 @@ onMounted(load);
           </el-table>
         </section>
         <section class="panel">
-          <h2>颜色时间线</h2>
-          <el-timeline v-if="batch.colorChanges.length">
-            <el-timeline-item v-for="item in batch.colorChanges" :key="item.id" :timestamp="new Date(item.occurredAt).toLocaleString()">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2 style="margin:0">颜色时间线</h2>
+            <el-button v-if="batch.status !== 'ARCHIVED'" link type="primary" size="small" @click="openBatchColorDialog">批量补录</el-button>
+          </div>
+          <el-alert
+            v-if="batch.status === 'ARCHIVED'"
+            title="批次已归档：颜色时间线与前后证据均为只读，不能补录、改色或作废。"
+            type="warning" :closable="false" style="margin:12px 0" />
+          <el-timeline v-if="activeColorChanges.length">
+            <el-timeline-item v-for="item in activeColorChanges" :key="item.id" :timestamp="new Date(item.occurredAt).toLocaleString()">
               <strong>{{ item.beforeColorName || "未记录" }} → {{ item.afterColorName }}</strong>
               <div><span v-if="item.afterColorHex" class="color-dot" :style="{ background: item.afterColorHex }" />{{ item.notes || "无备注" }}</div>
+              <div style="display:flex;gap:16px;margin-top:6px;flex-wrap:wrap">
+                <ColorEvidence :color-change-id="item.id" phase="BEFORE" :read-only="batch.status === 'ARCHIVED'" />
+                <ColorEvidence :color-change-id="item.id" phase="AFTER" :read-only="batch.status === 'ARCHIVED'" />
+              </div>
+              <el-button v-if="batch.status !== 'ARCHIVED'" link type="danger" size="small" @click="voidColorChange(item)">作废误录</el-button>
             </el-timeline-item>
           </el-timeline>
-          <el-empty v-else description="还没有颜色变化记录" />
+          <el-empty v-else description="还没有颜色变化记录" :image-size="70" />
+          <template v-if="voidedColorChanges.length">
+            <h3 style="margin:16px 0 8px;font-size:13px;color:#9a8570">已作废记录（时间链保留）</h3>
+            <el-timeline>
+              <el-timeline-item v-for="item in voidedColorChanges" :key="item.id" :timestamp="new Date(item.occurredAt).toLocaleString()" type="info">
+                <span style="text-decoration:line-through;color:#9a8570">{{ item.beforeColorName || "未记录" }} → {{ item.afterColorName }}</span>
+                <div style="font-size:12px;color:#9a8570">作废原因：{{ item.voidReason }}</div>
+              </el-timeline-item>
+            </el-timeline>
+          </template>
         </section>
       </div>
     </template>
@@ -215,6 +330,43 @@ onMounted(load);
         </div>
       </el-form>
       <template #footer><el-button @click="colorVisible = false">取消</el-button><el-button type="primary" :loading="saving" @click="submitColor">保存记录</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="batchColorVisible" title="批量补录颜色变化" width="860px">
+      <el-alert type="info" :closable="false" style="margin-bottom:12px"
+        title="按实际发生时间补录即可，与粘贴顺序无关：服务端会归并重排时间链，即使整批倒序录入，当前颜色仍唯一确定。补录完成后照片证据可在时间线各条目上分别上传（变化前/变化后）。" />
+      <el-table :data="backfillRows" size="small">
+        <el-table-column label="发生时间" width="210">
+          <template #default="{ row }"><el-date-picker v-model="row.occurredAt" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" size="small" style="width:100%" /></template>
+        </el-table-column>
+        <el-table-column label="类型" width="120">
+          <template #default="{ row }">
+            <el-select v-model="row.changeType" size="small">
+              <el-option value="OXIDATION" label="氧化" /><el-option value="DYE_BATH" label="染色" />
+              <el-option value="FINISHING" label="表面处理" /><el-option value="GLAZE" label="施釉" />
+              <el-option value="PATINA" label="锈化" /><el-option value="WEATHERING" label="风化" />
+              <el-option value="MIXING" label="混合" /><el-option value="OTHER" label="其他" />
+            </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="变化后颜色名称" min-width="140">
+          <template #default="{ row }"><el-input v-model="row.afterColorName" size="small" placeholder="如：靛蓝" /></template>
+        </el-table-column>
+        <el-table-column label="色值" width="130">
+          <template #default="{ row }"><el-input v-model="row.afterColorHex" size="small" placeholder="#1E3A8A" /></template>
+        </el-table-column>
+        <el-table-column label="备注" min-width="120">
+          <template #default="{ row }"><el-input v-model="row.notes" size="small" /></template>
+        </el-table-column>
+        <el-table-column label="" width="48">
+          <template #default="{ $index }"><el-button link type="danger" size="small" @click="removeBackfillRow($index)">删</el-button></template>
+        </el-table-column>
+      </el-table>
+      <el-button size="small" style="margin-top:10px" @click="addBackfillRow">+ 增加一行</el-button>
+      <template #footer>
+        <el-button @click="batchColorVisible = false">取消</el-button>
+        <el-button type="primary" :loading="batchSaving" @click="submitBatchColors">整批提交（{{ backfillRows.length }} 条）</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>

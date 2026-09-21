@@ -199,9 +199,11 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET/POST | `/color-changes` | 查询或记录 |
+| GET/POST | `/color-changes` | 查询或记录单条 |
+| POST | `/color-changes/batch` | 批量补录（可倒序提交） |
 | GET/PATCH | `/color-changes/:id` | 详情或更新备注 |
-| DELETE | `/color-changes/:id` | 删除最新误录记录 |
+| POST | `/color-changes/:id/void` | 作废误录记录（软删除，时间链保留） |
+| DELETE | `/color-changes/:id` | 等价于以“误录作废”为原因的幂等作废 |
 
 颜色变化：
 
@@ -219,7 +221,26 @@
 }
 ```
 
-颜色变化不扣库存。
+批量补录请求体（`changes` 内条目按实际发生时间填写，提交顺序任意，包括完全倒序；
+服务端按 `(occurred_at, seq)` 归并重排时间链，因此当前色始终唯一确定）：
+
+```json
+{
+  "batchId": "uuid",
+  "changes": [
+    { "key": "c", "changeType": "OTHER", "afterColorName": "最终色", "occurredAt": "2026-09-13T12:00:00+08:00" },
+    { "key": "b", "changeType": "OXIDATION", "afterColorName": "中间色", "occurredAt": "2026-09-13T10:00:00+08:00" },
+    { "key": "a", "changeType": "DYE_BATH", "afterColorName": "初变色", "occurredAt": "2026-09-13T08:00:00+08:00" }
+  ]
+}
+```
+
+单条与批量响应均带 `currentColorChanged`（当前色快照是否变化）。倒序补录历史色时该值为 `false`。
+
+作废请求：`{ "reason": "至少 3 个字" }`。作废不物理删除，记录与照片证据保留，当前色按时间链重算。
+`GET /color-changes` 默认只返回有效记录，加 `includeVoided=true` 可同时查看作废记录。
+
+颜色变化不扣库存。已归档批次的颜色时间线为只读：禁止新增、补录、改色、作废或上传证据。
 
 ## 9. 附件和导出
 
@@ -239,5 +260,6 @@
 - `ownerType`：`BATCH`、`COLOR_CHANGE`、`PROJECT` 或 `CONSUMPTION`
 - `ownerId`
 - `file`
+- `phase`：归属为 `COLOR_CHANGE` 时必填，`BEFORE`（变化前证据）或 `AFTER`（变化后证据）；其他归属忽略
 
 支持 JPEG、PNG、WebP，默认最大 10 MB。

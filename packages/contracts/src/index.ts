@@ -40,6 +40,9 @@ export type ColorChangeType = (typeof colorChangeTypes)[number];
 export const attachmentOwnerTypes = ["BATCH", "COLOR_CHANGE", "PROJECT", "CONSUMPTION"] as const;
 export type AttachmentOwnerType = (typeof attachmentOwnerTypes)[number];
 
+export const attachmentPhases = ["BEFORE", "AFTER"] as const;
+export type AttachmentPhase = (typeof attachmentPhases)[number];
+
 export const unitFamilies = {
   g: { family: "MASS", base: "g", factor: "1" },
   kg: { family: "MASS", base: "g", factor: "1000" },
@@ -243,6 +246,19 @@ export const colorChangePatchSchema = z.object({
   environmentNotes: z.string().trim().max(3000).nullable().optional(),
   notes: z.string().trim().max(3000).nullable().optional()
 }).refine((value) => Object.keys(value).length > 0, "至少提供一个可更新字段");
+
+export const colorChangeBatchItemSchema = colorChangeInputSchema.omit({ batchId: true }).extend({
+  key: z.string().trim().min(1).max(100).optional()
+});
+
+export const colorChangeBatchSchema = z.object({
+  batchId: z.string().uuid(),
+  changes: z.array(colorChangeBatchItemSchema).min(1).max(200)
+});
+
+export const colorChangeVoidSchema = z.object({
+  reason: z.string().trim().min(3).max(300)
+});
 
 export const reverseConsumptionSchema = z.object({
   reason: z.string().trim().min(3).max(1000)

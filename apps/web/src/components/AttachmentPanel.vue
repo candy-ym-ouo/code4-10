@@ -3,8 +3,16 @@ import { ref } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { request, ApiError } from "@/lib/api";
 
-type Attachment = { id: string; originalName: string; mimeType: string; byteSize: string; createdAt: string };
-const props = defineProps<{ ownerType: "BATCH" | "PROJECT" | "COLOR_CHANGE" | "CONSUMPTION"; ownerId: string; attachments: Attachment[] }>();
+type Attachment = { id: string; originalName: string; mimeType: string; byteSize: string; phase?: string | null; createdAt: string };
+const props = defineProps<{
+  ownerType: "BATCH" | "PROJECT" | "COLOR_CHANGE" | "CONSUMPTION";
+  ownerId: string;
+  attachments: Attachment[];
+  /** COLOR_CHANGE 证据必须标记变化前/变化后；其余归属不传 */
+  phase?: "BEFORE" | "AFTER";
+  title?: string;
+  compact?: boolean;
+}>();
 const emit = defineEmits<{ changed: [] }>();
 const uploading = ref(false);
 
@@ -17,6 +25,7 @@ async function upload(event: Event) {
     const body = new FormData();
     body.append("ownerType", props.ownerType);
     body.append("ownerId", props.ownerId);
+    if (props.phase) body.append("phase", props.phase);
     body.append("file", file);
     await request("/attachments", { method: "POST", body });
     ElMessage.success("图片已上传");
@@ -42,9 +51,9 @@ async function remove(id: string) {
 </script>
 
 <template>
-  <section class="panel">
+  <section :class="compact ? 'evidence-panel' : 'panel'">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-      <h2 style="margin:0">图片附件</h2>
+      <h2 :style="compact ? 'margin:0;font-size:14px' : 'margin:0'">{{ title || "图片附件" }}{{ phase === "BEFORE" ? "（变化前证据）" : phase === "AFTER" ? "（变化后证据）" : "" }}</h2>
       <label class="el-button el-button--primary el-button--small" :class="{ 'is-loading': uploading }">
         上传图片
         <input hidden type="file" accept="image/jpeg,image/png,image/webp" :disabled="uploading" @change="upload" />
@@ -59,6 +68,6 @@ async function remove(id: string) {
         </figcaption>
       </figure>
     </div>
-    <el-empty v-else description="还没有图片附件" :image-size="70" />
+    <el-empty v-else :description="phase ? '还没有证据照片' : '还没有图片附件'" :image-size="compact ? 40 : 70" />
   </section>
 </template>

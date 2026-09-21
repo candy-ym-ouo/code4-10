@@ -138,11 +138,40 @@ const backdatedColor = await call("/color-changes", {
     occurredAt: new Date(latestOccurredAt.getTime() - 60_000).toISOString()
   }
 });
-assert(backdatedColor.data.isCurrent === false, "Backdated color was treated as current");
+assert(backdatedColor.data.currentColorChanged === false, "Backdated color was treated as current");
 
 const afterConsumption = await call(`/batches/${batch.id}`);
 assert(afterConsumption.data.remainingQuantity === "500.000000", "Batch balance after consumption is incorrect");
 assert(afterConsumption.data.currentColorName === "Smoke Brown", "Current color was not updated");
+
+// 批量补录：故意完全倒序粘贴（最新在前、最旧在后），当前色仍唯一确定为最后一种
+const batchBackfill = await call("/color-changes/batch", {
+  method: "POST",
+  body: {
+    batchId: batch.id,
+    changes: [
+      { key: "c", changeType: "OTHER", afterColorName: "Batch Current", afterColorHex: "#006400", occurredAt: new Date(latestOccurredAt.getTime() + 120_000).toISOString() },
+      { key: "b", changeType: "OXIDATION", afterColorName: "Batch Middle", afterColorHex: "#808000", occurredAt: new Date(latestOccurredAt.getTime() + 60_000).toISOString() },
+      { key: "a", changeType: "OXIDATION", afterColorName: "Batch First", afterColorHex: "#F0E68C", occurredAt: new Date(latestOccurredAt.getTime() + 30_000).toISOString() }
+    ]
+  }
+});
+assert(batchBackfill.data.count === 3, "Batch backfill count is incorrect");
+assert(batchBackfill.data.currentColorChanged === true, "Batch backfill did not update current color");
+const afterBackfill = await call(`/batches/${batch.id}`);
+assert(afterBackfill.data.currentColorName === "Batch Current", "Reverse-order batch backfill produced a non-unique current color");
+// 时间线按 (occurred_at, seq) 升序，Batch First 必须在 Batch Current 之前
+const activeNames = afterBackfill.data.colorChanges.filter((c) => !c.voidedAt).map((c) => c.afterColorName);
+assert(activeNames.indexOf("Batch First") < activeNames.indexOf("Batch Current"), "Backfilled timeline order is wrong");
+
+// 作废误录（软删除）：记录仍在，当前色回退到 Batch Middle，时间链不被破坏
+const currentChange = afterBackfill.data.colorChanges.find((c) => c.afterColorName === "Batch Current");
+await call(`/color-changes/${currentChange.id}/void`, { method: "POST", body: { reason: "Smoke mistaken entry" } });
+const afterVoid = await call(`/batches/${batch.id}`);
+assert(afterVoid.data.currentColorName === "Batch Middle", "Current color did not roll back after void");
+const voidedRow = afterVoid.data.colorChanges.find((c) => c.id === currentChange.id);
+assert(voidedRow && voidedRow.voidedAt, "Voided color change was physically removed from the timeline");
+
 const projectAfterConsumption = await call(`/projects/${project.data.id}`);
 assert(projectAfterConsumption.data.requirements[0].actualQuantity === "500.000000", "Project actual quantity is incorrect");
 assert(projectAfterConsumption.data.status === "IN_PROGRESS", "First consumption did not start the planned project");
@@ -152,7 +181,7 @@ const afterReversal = await call(`/batches/${batch.id}`);
 assert(afterReversal.data.remainingQuantity === "1000.000000", "Batch balance after reversal is incorrect");
 assert(afterReversal.data.movements[0].type === "REVERSAL", "Reversal movement was not created");
 
-const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Smoke Brown", stockState: "in_stock" })}`);
+const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Batch Middle", stockState: "in_stock" })}`);
 assert(search.meta.total >= 1, "Material search did not find the smoke-test material");
 
 console.log(JSON.stringify({

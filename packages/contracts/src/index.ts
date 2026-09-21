@@ -220,6 +220,9 @@ export const consumptionInputSchema = z.object({
   path: ["usedQuantity"]
 });
 
+export const attachmentPhases = ["GENERAL", "BEFORE", "AFTER"] as const;
+export type AttachmentPhase = (typeof attachmentPhases)[number];
+
 export const colorChangeInputSchema = z.object({
   batchId: z.string().uuid(),
   projectId: z.string().uuid().nullable().optional(),
@@ -238,6 +241,71 @@ export const colorChangeInputSchema = z.object({
   occurredAt: z.string().datetime({ offset: true }),
   notes: z.string().trim().max(3000).nullable().optional()
 });
+
+// 单条补录时由服务器按发生时间在时间链上归位，批量条目本身不带 batchId。
+export const colorChangeEntrySchema = z.object({
+  projectId: z.string().uuid().nullable().optional(),
+  consumptionId: z.string().uuid().nullable().optional(),
+  changeType: z.enum(colorChangeTypes),
+  beforeColorName: z.string().trim().max(80).nullable().optional(),
+  beforeColorHex: z.union([colorHex, z.literal("")]).nullable().optional(),
+  afterColorName: z.string().trim().min(1).max(80),
+  afterColorHex: z.union([colorHex, z.literal("")]).nullable().optional(),
+  affectedQuantity: positiveQuantity.nullable().optional(),
+  unit: z.enum(stockUnits).nullable().optional(),
+  temperatureC: z.number().min(-100).max(2000).nullable().optional(),
+  humidityPercent: z.number().min(0).max(100).nullable().optional(),
+  phValue: z.number().min(0).max(14).nullable().optional(),
+  environmentNotes: z.string().trim().max(3000).nullable().optional(),
+  occurredAt: z.string().datetime({ offset: true }),
+  notes: z.string().trim().max(3000).nullable().optional()
+});
+
+export const colorChangeBulkSchema = z.object({
+  batchId: z.string().uuid(),
+  entries: z.array(colorChangeEntrySchema).min(1, "至少补录一条颜色变化").max(100, "单次最多补录 100 条颜色变化")
+});
+
+export type ColorChangeChainRow = {
+  key: string;
+  occurredAt: string;
+  createdAt: string;
+};
+
+export type ColorChangeNewEntry = {
+  index: number;
+  occurredAt: string;
+};
+
+/**
+ * 把新条目按发生时间合并进既有时间链，返回合并后从旧到新的完整序位计划。
+ * 同时刻时：既有记录（按创建先后）在前，新条目按提交顺序在后，保证序位完全确定，
+ * 因此无论录入是正序还是倒序，链尾（seq 最大）都是唯一当前色。
+ */
+export function planColorChainSeq(existing: ColorChangeChainRow[], entries: ColorChangeNewEntry[]): string[] {
+  const orderedExisting = [...existing].sort((a, b) => {
+    const time = Date.parse(a.occurredAt) - Date.parse(b.occurredAt);
+    if (time !== 0) return time;
+    const created = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+    if (created !== 0) return created;
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
+  const orderedEntries = [...entries].sort((a, b) => {
+    const time = Date.parse(a.occurredAt) - Date.parse(b.occurredAt);
+    if (time !== 0) return time;
+    return a.index - b.index;
+  });
+
+  const merged: Array<{ key: string; time: number; createdAtMs: number; rank: number; index: number }> = [];
+  for (const [index, row] of orderedExisting.entries()) {
+    merged.push({ key: row.key, time: Date.parse(row.occurredAt), createdAtMs: Date.parse(row.createdAt), rank: 0, index });
+  }
+  for (const entry of orderedEntries) {
+    merged.push({ key: `new:${entry.index}`, time: Date.parse(entry.occurredAt), createdAtMs: Number.POSITIVE_INFINITY, rank: 1, index: entry.index });
+  }
+  merged.sort((a, b) => a.time - b.time || a.rank - b.rank || (a.rank === 0 ? a.createdAtMs - b.createdAtMs || a.index - b.index : a.index - b.index));
+  return merged.map((item) => item.key);
+}
 
 export const colorChangePatchSchema = z.object({
   environmentNotes: z.string().trim().max(3000).nullable().optional(),

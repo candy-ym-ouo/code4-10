@@ -106,7 +106,7 @@ export async function batchRoutes(app: FastifyInstance): Promise<void> {
       [request.params.id]
     );
     if (!result.rows[0]) throw new AppError(404, "NOT_FOUND", "批次不存在");
-    const [movements, colors, attachments] = await Promise.all([
+    const [movements, colors, attachments, colorAttachments] = await Promise.all([
       pool.query(
         `SELECT id, type, signed_quantity::text AS "signedQuantity", stock_unit AS "stockUnit",
                 before_quantity::text AS "beforeQuantity", after_quantity::text AS "afterQuantity",
@@ -115,19 +115,45 @@ export async function batchRoutes(app: FastifyInstance): Promise<void> {
         [request.params.id]
       ),
       pool.query(
-        `SELECT id, change_type AS "changeType", before_color_name AS "beforeColorName", before_color_hex AS "beforeColorHex",
-                after_color_name AS "afterColorName", after_color_hex AS "afterColorHex", occurred_at AS "occurredAt",
-                notes, project_id AS "projectId", consumption_id AS "consumptionId"
-           FROM color_changes WHERE batch_id = $1 ORDER BY occurred_at DESC, created_at DESC`,
+        `SELECT cc.id, cc.change_type AS "changeType", cc.before_color_name AS "beforeColorName", cc.before_color_hex AS "beforeColorHex",
+                cc.before_color_explicit AS "beforeColorExplicit",
+                cc.after_color_name AS "afterColorName", cc.after_color_hex AS "afterColorHex",
+                cc.occurred_at AS "occurredAt", cc.seq, cc.notes, cc.project_id AS "projectId", cc.consumption_id AS "consumptionId",
+                cc.id = (
+                  SELECT c2.id FROM color_changes c2
+                   WHERE c2.batch_id = cc.batch_id AND c2.deleted_at IS NULL
+                   ORDER BY c2.seq DESC LIMIT 1
+                ) AS "isCurrent"
+           FROM color_changes cc
+          WHERE cc.batch_id = $1 AND cc.deleted_at IS NULL
+          ORDER BY cc.occurred_at DESC, cc.seq DESC`,
         [request.params.id]
       ),
       pool.query(
-        `SELECT id, original_name AS "originalName", mime_type AS "mimeType", byte_size::text AS "byteSize", created_at AS "createdAt"
+        `SELECT id, original_name AS "originalName", mime_type AS "mimeType", byte_size::text AS "byteSize", phase, created_at AS "createdAt"
            FROM attachments WHERE owner_type = 'BATCH' AND owner_id = $1 ORDER BY created_at DESC`,
+        [request.params.id]
+      ),
+      pool.query(
+        `SELECT a.id, a.owner_id AS "ownerId", a.original_name AS "originalName", a.mime_type AS "mimeType",
+                a.byte_size::text AS "byteSize", a.phase, a.created_at AS "createdAt"
+           FROM attachments a JOIN color_changes cc ON cc.id = a.owner_id AND a.owner_type = 'COLOR_CHANGE'
+          WHERE cc.batch_id = $1 AND cc.deleted_at IS NULL
+          ORDER BY a.phase, a.created_at DESC`,
         [request.params.id]
       )
     ]);
-    return { data: { ...result.rows[0], movements: movements.rows, colorChanges: colors.rows, attachments: attachments.rows } };
+    const attachmentsByColor = new Map<string, unknown[]>();
+    for (const row of colorAttachments.rows) {
+      const list = attachmentsByColor.get(row.ownerId) ?? [];
+      list.push(row);
+      attachmentsByColor.set(row.ownerId, list);
+    }
+    const colorChanges = colors.rows.map((row) => ({
+      ...row,
+      attachments: attachmentsByColor.get(row.id) ?? []
+    }));
+    return { data: { ...result.rows[0], movements: movements.rows, colorChanges, attachments: attachments.rows } };
   });
 
   app.post("/batches", async (request, reply) => {

@@ -155,6 +155,69 @@ assert(afterReversal.data.movements[0].type === "REVERSAL", "Reversal movement w
 const search = await call(`/materials?${new URLSearchParams({ q: `Smoke Material ${suffix}`, craftType: "GENERAL", color: "Smoke Brown", stockState: "in_stock" })}`);
 assert(search.meta.total >= 1, "Material search did not find the smoke-test material");
 
+// 批量补录：故意按倒序提交更早的三次历史变色，链尾仍必须是 Smoke Brown。
+const bulkBase = latestOccurredAt.getTime() - 10 * 60_000;
+const bulk = await call("/color-changes/bulk", {
+  method: "POST",
+  body: {
+    batchId: batch.id,
+    entries: [
+      { changeType: "OTHER", afterColorName: "Smoke Oldest", afterColorHex: "#222222", occurredAt: new Date(bulkBase - 20_000).toISOString() },
+      { changeType: "OTHER", afterColorName: "Smoke Middle", afterColorHex: "#444444", occurredAt: new Date(bulkBase - 10_000).toISOString() },
+      { changeType: "OTHER", afterColorName: "Smoke Oldest2", afterColorHex: "#666666", occurredAt: new Date(bulkBase - 5_000).toISOString() }
+    ]
+  }
+});
+assert(bulk.data.data.length === 3, "Bulk backfill did not create three records");
+assert(bulk.data.data.every((item) => item.isCurrent === false), "Backfilled history rows must not be current");
+const afterBulk = await call(`/batches/${batch.id}`);
+assert(afterBulk.data.currentColorName === "Smoke Brown", "Reverse-order bulk backfill changed the unique current color");
+const orderedSeqs = afterBulk.data.colorChanges.map((item) => item.seq);
+assert(orderedSeqs.every((seq, index) => index === 0 || seq < orderedSeqs[index - 1]), "Color chain seq is not ordered on the timeline");
+assert(new Set(orderedSeqs).size === orderedSeqs.length, "Color chain seq is not unique");
+
+// 删除链中误录（非当前色）：软删除后链序压实、前后衔接修复，当前色不变。
+const misrecord = bulk.data.data.find((item) => item.afterColorName === "Smoke Middle");
+await call(`/color-changes/${misrecord.id}`, { method: "DELETE" });
+const afterDelete = await call(`/batches/${batch.id}`);
+assert(afterDelete.data.currentColorName === "Smoke Brown", "Deleting a middle misrecord changed the current color");
+const liveSeqs = afterDelete.data.colorChanges.map((item) => item.seq).sort((a, b) => a - b);
+assert(liveSeqs.every((seq, index) => seq === index + 1), "Color chain seq has gaps after misrecord deletion");
+
+// 归档批次禁止改色：建一个零余额批次，归档后新增与批量补录一律 409。
+const emptyMaterial = await call("/materials", {
+  method: "POST",
+  body: { name: `Smoke Empty Material ${suffix}`, craftTypes: ["GENERAL"], stockUnit: "g", tags: ["smoke"] }
+});
+const emptyBatch = await call("/batches", {
+  method: "POST",
+  headers: { "Idempotency-Key": `smoke-empty-batch-${suffix}` },
+  body: { materialId: emptyMaterial.data.id, receivedAt: new Date().toISOString().slice(0, 10), initialQuantity: "1", entryUnit: "g" }
+});
+await call(`/batches/${emptyBatch.data.id}/adjustments`, {
+  method: "POST",
+  headers: { "Idempotency-Key": `smoke-empty-adjust-${suffix}` },
+  body: { direction: "OUT", quantity: "1000", unit: "g", reason: "Smoke test depletion for archive", version: 1 }
+});
+await call(`/batches/${emptyBatch.data.id}/archive`, { method: "POST" });
+async function expectConflict(label, fn) {
+  try {
+    await fn();
+    throw new Error(`${label}: archived batch mutation was not blocked`);
+  } catch (error) {
+    // call() 失败信息形如 "POST /path -> 409 {...}"。
+    assert(/-> 409\b/.test(String(error.message)), `${label}: expected 409 conflict`);
+  }
+}
+await expectConflict("archived create color", () => call("/color-changes", {
+  method: "POST",
+  body: { batchId: emptyBatch.data.id, changeType: "OTHER", afterColorName: "Nope", occurredAt: new Date().toISOString() }
+}));
+await expectConflict("archived bulk color", () => call("/color-changes/bulk", {
+  method: "POST",
+  body: { batchId: emptyBatch.data.id, entries: [{ changeType: "OTHER", afterColorName: "Nope", occurredAt: new Date().toISOString() }] }
+}));
+
 console.log(JSON.stringify({
   result: "PASS",
   sourceId: source.data.id,

@@ -100,9 +100,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         `SELECT cc.id, cc.batch_id AS "batchId", b.batch_code AS "batchCode", cc.change_type AS "changeType",
                 cc.before_color_name AS "beforeColorName", cc.before_color_hex AS "beforeColorHex",
                 cc.after_color_name AS "afterColorName", cc.after_color_hex AS "afterColorHex",
-                cc.occurred_at AS "occurredAt", cc.notes
+                cc.occurred_at AS "occurredAt", cc.seq, cc.notes
            FROM color_changes cc JOIN batches b ON b.id = cc.batch_id
-          WHERE cc.project_id = $1 ORDER BY cc.occurred_at DESC`,
+          WHERE cc.project_id = $1 AND cc.deleted_at IS NULL ORDER BY cc.occurred_at DESC, cc.seq DESC`,
         [request.params.id]
       ),
       pool.query(

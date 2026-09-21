@@ -200,8 +200,9 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET/POST | `/color-changes` | 查询或记录 |
+| POST | `/color-changes/bulk` | 批量补录同一批次的历史颜色 |
 | GET/PATCH | `/color-changes/:id` | 详情或更新备注 |
-| DELETE | `/color-changes/:id` | 删除最新误录记录 |
+| DELETE | `/color-changes/:id` | 软删除误录记录并修复时间链 |
 
 颜色变化：
 
@@ -219,7 +220,26 @@
 }
 ```
 
-颜色变化不扣库存。
+批量补录（条目按实际 `occurredAt` 归位，与提交顺序无关；倒序提交也能唯一确定链尾当前色）：
+
+```json
+{
+  "batchId": "uuid",
+  "entries": [
+    { "changeType": "DYE_BATH", "afterColorName": "红", "occurredAt": "2026-09-01T10:00:00+08:00" },
+    { "changeType": "OXIDATION", "afterColorName": "深棕", "occurredAt": "2026-09-05T16:00:00+08:00" }
+  ]
+}
+```
+
+返回中 `headColorChangeId` 为重排后唯一链尾（当前色）记录；每条记录带 `seq`（链序）与 `isCurrent`。
+
+颜色变化规则：
+
+- 颜色变化不扣库存。
+- 每条记录的“变化前颜色”默认沿用上一条链记录的结果色；请求显式提供 `beforeColorName/Hex` 时视为人工证据，后续重排不会覆盖。
+- 删除误录为软删除：记录保留并标记 `deletedAt`，链序压实、前后衔接与批次当前色在同一事务内重算；记录存在附件时必须先删除照片。
+- 批次一旦归档，颜色记录只读：禁止新增、批量补录、改备注、删除以及上传颜色证据。
 
 ## 9. 附件和导出
 
@@ -239,5 +259,6 @@
 - `ownerType`：`BATCH`、`COLOR_CHANGE`、`PROJECT` 或 `CONSUMPTION`
 - `ownerId`
 - `file`
+- `phase`：仅颜色变化使用，`BEFORE`（变化前证据）或 `AFTER`（变化后证据）；不传时颜色变化默认 `AFTER`，其他归属为 `GENERAL`
 
 支持 JPEG、PNG、WebP，默认最大 10 MB。
